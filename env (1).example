@@ -1,0 +1,3 @@
+GOOGLE_API_KEY=your_google_routes_api_key_here
+PORT=3000
+BASE_URL=https://your-railway-url.up.railway.app
