@@ -95,8 +95,16 @@ async function runGetQuote(args) {
 async function handleMCP(body, sendResponse) {
   const { jsonrpc, id, method, params } = body;
   console.log("MCP method:", method);
+
   if (method === "initialize") {
-    return sendResponse({ jsonrpc, id, result: { protocolVersion: params && params.protocolVersion ? params.protocolVersion : "2024-11-05", serverInfo: { name: "towco-mcp", version: "1.0.0" }, capabilities: { tools: {} } } });
+    return sendResponse({
+      jsonrpc, id,
+      result: {
+        protocolVersion: params && params.protocolVersion ? params.protocolVersion : "2024-11-05",
+        serverInfo: { name: "towco-mcp", version: "1.0.0" },
+        capabilities: { tools: {} },
+      },
+    });
   }
   if (method === "notifications/initialized") return sendResponse({ jsonrpc, id, result: {} });
   if (method === "tools/list") return sendResponse({ jsonrpc, id, result: { tools: TOOLS } });
@@ -114,23 +122,11 @@ async function handleMCP(body, sendResponse) {
   return sendResponse({ jsonrpc, id, result: {} });
 }
 
-// ─── HTTP Streamable — POST /mcp (GHL) ───────────────────────────────────
-app.post("/mcp", async (req, res) => {
-  res.setHeader("Content-Type", "application/json");
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  await handleMCP(req.body, (payload) => res.json(payload));
-});
-app.options("/mcp", (req, res) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-  res.sendStatus(200);
-});
-
-// ─── SSE — GET + POST /sse (Retell) ──────────────────────────────────────
+// ─── SSE clients ──────────────────────────────────────────────────────────
 const clients = new Map();
 let clientId = 0;
 
+// ─── GET /sse — open SSE stream ───────────────────────────────────────────
 app.get("/sse", (req, res) => {
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
@@ -145,6 +141,7 @@ app.get("/sse", (req, res) => {
   req.on("close", () => { clients.delete(id); clearInterval(ping); });
 });
 
+// ─── POST /sse — Retell posts MCP messages here ───────────────────────────
 app.post("/sse", async (req, res) => {
   res.setHeader("Content-Type", "application/json");
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -152,17 +149,33 @@ app.post("/sse", async (req, res) => {
   const client = id ? clients.get(id) : null;
   await handleMCP(req.body, (payload) => {
     if (client) client.write("event: message\ndata: " + JSON.stringify(payload) + "\n\n");
-    res.json({ status: "ok" });
+    res.json(payload);
   });
 });
 
-app.options("/sse", (req, res) => {
+// ─── POST / — Retell sometimes posts to root ─────────────────────────────
+app.post("/", async (req, res) => {
+  res.setHeader("Content-Type", "application/json");
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  await handleMCP(req.body, (payload) => res.json(payload));
+});
+
+// ─── POST /mcp — GHL uses this ────────────────────────────────────────────
+app.post("/mcp", async (req, res) => {
+  res.setHeader("Content-Type", "application/json");
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  await handleMCP(req.body, (payload) => res.json(payload));
+});
+
+// ─── OPTIONS preflight ────────────────────────────────────────────────────
+app.options("*", (req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
   res.sendStatus(200);
 });
 
+// ─── Legacy /message ──────────────────────────────────────────────────────
 app.post("/message", async (req, res) => {
   const id = parseInt(req.query.clientId);
   const client = clients.get(id);
@@ -172,6 +185,7 @@ app.post("/message", async (req, res) => {
   });
 });
 
+// ─── Health check ─────────────────────────────────────────────────────────
 app.get("/", (req, res) => res.json({ status: "Towco MCP server running", key_present: !!GOOGLE_API_KEY }));
 
 app.listen(PORT, () => console.log("Towco MCP server running on port " + PORT));
