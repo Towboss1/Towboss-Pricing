@@ -11,10 +11,6 @@ app.use((req, res, next) => {
 const PORT = process.env.PORT || 3000;
 const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;
 
-// ─── Pricing ───────────────────────────────────────────────────────────────
-// $225 flat includes first 10 miles
-// Over 10 miles: $6.25 per additional mile
-
 function calculateTotal(miles) {
   if (miles <= 10) {
     return { total: 225, extra_miles: 0, extra_cost: 0 };
@@ -35,13 +31,13 @@ function buildSpokenQuote(vehicle, miles, pricing) {
 const TOOLS = [
   {
     name: "get_quote",
-    description: "Calculates real road driving distance and returns an accurate towing quote. Call this once you have the pickup address, drop-off address, and vehicle year/make/model.",
+    description: "Calculates real road driving distance and returns an accurate towing quote. Only call this with exact addresses confirmed by the caller. Never pass assumed or made-up addresses.",
     inputSchema: {
       type: "object",
       required: ["origin", "destination", "vehicle"],
       properties: {
-        origin: { type: "string", description: "Full pickup address including city and state exactly as the caller provided it" },
-        destination: { type: "string", description: "Full drop-off address including city and state exactly as the caller provided it" },
+        origin: { type: "string", description: "Exact pickup address including street number, street name, city and state as confirmed by the caller" },
+        destination: { type: "string", description: "Exact drop-off address including street number, street name, city and state as confirmed by the caller" },
         vehicle: { type: "string", description: "Year make and model e.g. 2019 Honda Civic" },
       },
     },
@@ -50,6 +46,7 @@ const TOOLS = [
 
 async function getDistance(origin, destination) {
   console.log("Getting distance:", origin, "->", destination);
+
   const res = await axios.post(
     "https://routes.googleapis.com/directions/v2:computeRoutes",
     {
@@ -63,12 +60,26 @@ async function getDistance(origin, destination) {
       headers: {
         "Content-Type": "application/json",
         "X-Goog-Api-Key": GOOGLE_API_KEY,
-        "X-Goog-FieldMask": "routes.distanceMeters,routes.duration",
+        "X-Goog-FieldMask": "routes.distanceMeters,routes.duration,routes.legs",
       },
     }
   );
-  const route = res.data && res.data.routes && res.data.routes[0];
-  if (!route) throw new Error("No route found between these addresses.");
+
+  const data = res.data;
+  console.log("Routes API response:", JSON.stringify(data));
+
+  // No routes returned at all
+  if (!data.routes || data.routes.length === 0) {
+    throw new Error("ADDRESS_NOT_FOUND");
+  }
+
+  const route = data.routes[0];
+
+  // Route exists but no distance — likely unresolvable address
+  if (!route.distanceMeters || route.distanceMeters === 0) {
+    throw new Error("ADDRESS_NOT_FOUND");
+  }
+
   const miles = Math.ceil((route.distanceMeters / 1609.344) * 10) / 10;
   const durationMin = Math.round(parseInt(route.duration) / 60);
   console.log("Distance:", miles, "miles,", durationMin, "mins");
@@ -76,35 +87,53 @@ async function getDistance(origin, destination) {
 }
 
 async function runGetQuote(args) {
-  const { miles, duration } = await getDistance(args.origin, args.destination);
-  const pricing = calculateTotal(miles);
-  const spoken_quote = buildSpokenQuote(args.vehicle, miles, pricing);
-  return {
-    vehicle: args.vehicle,
-    miles,
-    duration,
-    base_rate: 225,
-    extra_miles: pricing.extra_miles,
-    extra_cost: pricing.extra_cost,
-    total: pricing.total,
-    spoken_quote,
-  };
+  const origin = args.origin || "";
+  const destination = args.destination || "";
+  const vehicle = args.vehicle || "";
+
+  // Reject if addresses look incomplete — no street number or too short
+  if (origin.trim().length < 10 || destination.trim().length < 10) {
+    return {
+      error: true,
+      spoken_quote: "I wasn't able to verify that address. Can you give me the full street address including the street number, street name, and city?",
+    };
+  }
+
+  try {
+    const { miles, duration } = await getDistance(origin, destination);
+    const pricing = calculateTotal(miles);
+    const spoken_quote = buildSpokenQuote(vehicle, miles, pricing);
+    return {
+      vehicle,
+      miles,
+      duration,
+      base_rate: 225,
+      extra_miles: pricing.extra_miles,
+      extra_cost: pricing.extra_cost,
+      total: pricing.total,
+      spoken_quote,
+    };
+  } catch (err) {
+    console.error("Quote error:", err.message);
+    if (err.message === "ADDRESS_NOT_FOUND") {
+      return {
+        error: true,
+        spoken_quote: "I wasn't able to locate that address. Can you double-check the street address and city for me?",
+      };
+    }
+    return {
+      error: true,
+      spoken_quote: "I'm having trouble pulling the distance right now. Let me have a dispatcher call you back with the quote.",
+    };
+  }
 }
 
 // ─── Core MCP handler ─────────────────────────────────────────────────────
 async function handleMCP(body, sendResponse) {
   const { jsonrpc, id, method, params } = body;
   console.log("MCP method:", method);
-
   if (method === "initialize") {
-    return sendResponse({
-      jsonrpc, id,
-      result: {
-        protocolVersion: params && params.protocolVersion ? params.protocolVersion : "2024-11-05",
-        serverInfo: { name: "towco-mcp", version: "1.0.0" },
-        capabilities: { tools: {} },
-      },
-    });
+    return sendResponse({ jsonrpc, id, result: { protocolVersion: params && params.protocolVersion ? params.protocolVersion : "2024-11-05", serverInfo: { name: "towco-mcp", version: "1.0.0" }, capabilities: { tools: {} } } });
   }
   if (method === "notifications/initialized") return sendResponse({ jsonrpc, id, result: {} });
   if (method === "tools/list") return sendResponse({ jsonrpc, id, result: { tools: TOOLS } });
@@ -122,11 +151,24 @@ async function handleMCP(body, sendResponse) {
   return sendResponse({ jsonrpc, id, result: {} });
 }
 
-// ─── SSE clients ──────────────────────────────────────────────────────────
+// ─── HTTP Streamable — POST /mcp (GHL) ───────────────────────────────────
+app.post("/mcp", async (req, res) => {
+  res.setHeader("Content-Type", "application/json");
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  await handleMCP(req.body, (payload) => res.json(payload));
+});
+
+// ─── POST / — Retell posts to root ───────────────────────────────────────
+app.post("/", async (req, res) => {
+  res.setHeader("Content-Type", "application/json");
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  await handleMCP(req.body, (payload) => res.json(payload));
+});
+
+// ─── SSE — GET + POST /sse (Retell) ──────────────────────────────────────
 const clients = new Map();
 let clientId = 0;
 
-// ─── GET /sse — open SSE stream ───────────────────────────────────────────
 app.get("/sse", (req, res) => {
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
@@ -141,7 +183,6 @@ app.get("/sse", (req, res) => {
   req.on("close", () => { clients.delete(id); clearInterval(ping); });
 });
 
-// ─── POST /sse — Retell posts MCP messages here ───────────────────────────
 app.post("/sse", async (req, res) => {
   res.setHeader("Content-Type", "application/json");
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -153,21 +194,6 @@ app.post("/sse", async (req, res) => {
   });
 });
 
-// ─── POST / — Retell sometimes posts to root ─────────────────────────────
-app.post("/", async (req, res) => {
-  res.setHeader("Content-Type", "application/json");
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  await handleMCP(req.body, (payload) => res.json(payload));
-});
-
-// ─── POST /mcp — GHL uses this ────────────────────────────────────────────
-app.post("/mcp", async (req, res) => {
-  res.setHeader("Content-Type", "application/json");
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  await handleMCP(req.body, (payload) => res.json(payload));
-});
-
-// ─── OPTIONS preflight ────────────────────────────────────────────────────
 app.options("*", (req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
@@ -175,7 +201,6 @@ app.options("*", (req, res) => {
   res.sendStatus(200);
 });
 
-// ─── Legacy /message ──────────────────────────────────────────────────────
 app.post("/message", async (req, res) => {
   const id = parseInt(req.query.clientId);
   const client = clients.get(id);
@@ -185,7 +210,6 @@ app.post("/message", async (req, res) => {
   });
 });
 
-// ─── Health check ─────────────────────────────────────────────────────────
 app.get("/", (req, res) => res.json({ status: "Towco MCP server running", key_present: !!GOOGLE_API_KEY }));
 
 app.listen(PORT, () => console.log("Towco MCP server running on port " + PORT));
