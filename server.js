@@ -31,27 +31,70 @@ function buildSpokenQuote(vehicle, miles, pricing) {
 const TOOLS = [
   {
     name: "get_quote",
-    description: "Calculates real road driving distance and returns an accurate towing quote. Only call this with exact addresses confirmed by the caller. Never pass assumed or made-up addresses.",
+    description: "Calculates real road driving distance and returns an accurate towing quote. Only call this with exact addresses confirmed by the caller.",
     inputSchema: {
       type: "object",
       required: ["origin", "destination", "vehicle"],
       properties: {
-        origin: { type: "string", description: "Exact pickup address including street number, street name, city and state as confirmed by the caller" },
-        destination: { type: "string", description: "Exact drop-off address including street number, street name, city and state as confirmed by the caller" },
+        origin: { type: "string", description: "Exact pickup address with street number, street name, city and state as confirmed by the caller" },
+        destination: { type: "string", description: "Exact drop-off address with street number, street name, city and state as confirmed by the caller" },
         vehicle: { type: "string", description: "Year make and model e.g. 2019 Honda Civic" },
       },
     },
   },
 ];
 
-async function getDistance(origin, destination) {
-  console.log("Getting distance:", origin, "->", destination);
+// ─── Geocode and validate address ─────────────────────────────────────────
+async function validateAndGeocode(address) {
+  console.log("Validating address:", address);
+  const res = await axios.post(
+    "https://addressvalidation.googleapis.com/v1:validateAddress",
+    {
+      address: { addressLines: [address] },
+    },
+    {
+      headers: {
+        "Content-Type": "application/json",
+        "X-Goog-Api-Key": GOOGLE_API_KEY,
+      },
+    }
+  );
 
+  const result = res.data && res.data.result;
+  const verdict = result && result.verdict;
+  const geocode = result && result.geocode;
+
+  console.log("Address verdict:", JSON.stringify(verdict));
+
+  if (!verdict || !geocode) {
+    throw new Error("ADDRESS_NOT_FOUND:" + address);
+  }
+
+  // Reject if address is not complete or not confirmed at street level
+  const hasUnconfirmed = verdict.hasUnconfirmedComponents;
+  const addressComplete = verdict.addressComplete;
+  const granularity = verdict.geocodeGranularity;
+
+  console.log("Complete:", addressComplete, "Granularity:", granularity, "Unconfirmed:", hasUnconfirmed);
+
+  // Must be at least PREMISE or ROUTE level and complete
+  const validGranularity = ["PREMISE", "SUB_PREMISE", "ROUTE"].includes(granularity);
+
+  if (!addressComplete || !validGranularity || hasUnconfirmed) {
+    throw new Error("ADDRESS_NOT_FOUND:" + address);
+  }
+
+  const location = geocode.location;
+  return { lat: location.latitude, lng: location.longitude, formatted: result.address && result.address.formattedAddress };
+}
+
+// ─── Get distance between validated coordinates ───────────────────────────
+async function getDistanceFromCoords(origin, destination) {
   const res = await axios.post(
     "https://routes.googleapis.com/directions/v2:computeRoutes",
     {
-      origin: { address: origin },
-      destination: { address: destination },
+      origin: { location: { latLng: { latitude: origin.lat, longitude: origin.lng } } },
+      destination: { location: { latLng: { latitude: destination.lat, longitude: destination.lng } } },
       travelMode: "DRIVE",
       routingPreference: "TRAFFIC_UNAWARE",
       units: "IMPERIAL",
@@ -60,25 +103,13 @@ async function getDistance(origin, destination) {
       headers: {
         "Content-Type": "application/json",
         "X-Goog-Api-Key": GOOGLE_API_KEY,
-        "X-Goog-FieldMask": "routes.distanceMeters,routes.duration,routes.legs",
+        "X-Goog-FieldMask": "routes.distanceMeters,routes.duration",
       },
     }
   );
 
-  const data = res.data;
-  console.log("Routes API response:", JSON.stringify(data));
-
-  // No routes returned at all
-  if (!data.routes || data.routes.length === 0) {
-    throw new Error("ADDRESS_NOT_FOUND");
-  }
-
-  const route = data.routes[0];
-
-  // Route exists but no distance — likely unresolvable address
-  if (!route.distanceMeters || route.distanceMeters === 0) {
-    throw new Error("ADDRESS_NOT_FOUND");
-  }
+  const route = res.data && res.data.routes && res.data.routes[0];
+  if (!route || !route.distanceMeters) throw new Error("NO_ROUTE");
 
   const miles = Math.ceil((route.distanceMeters / 1609.344) * 10) / 10;
   const durationMin = Math.round(parseInt(route.duration) / 60);
@@ -87,22 +118,49 @@ async function getDistance(origin, destination) {
 }
 
 async function runGetQuote(args) {
-  const origin = args.origin || "";
-  const destination = args.destination || "";
-  const vehicle = args.vehicle || "";
+  const origin = (args.origin || "").trim();
+  const destination = (args.destination || "").trim();
+  const vehicle = (args.vehicle || "").trim();
 
-  // Reject if addresses look incomplete — no street number or too short
-  if (origin.trim().length < 10 || destination.trim().length < 10) {
+  if (origin.length < 5 || destination.length < 5) {
     return {
       error: true,
-      spoken_quote: "I wasn't able to verify that address. Can you give me the full street address including the street number, street name, and city?",
+      spoken_quote: "I need the full street address including the street number and city. Can you give me that?",
     };
   }
 
   try {
-    const { miles, duration } = await getDistance(origin, destination);
+    // Validate both addresses first
+    let originGeo, destGeo;
+
+    try {
+      originGeo = await validateAndGeocode(origin);
+    } catch (e) {
+      console.log("Origin validation failed:", e.message);
+      return {
+        error: true,
+        spoken_quote: "I wasn't able to verify the pickup address. Can you double-check the street number, street name, and city for me?",
+      };
+    }
+
+    try {
+      destGeo = await validateAndGeocode(destination);
+    } catch (e) {
+      console.log("Destination validation failed:", e.message);
+      return {
+        error: true,
+        spoken_quote: "I wasn't able to verify the drop-off address. Can you double-check that address for me?",
+      };
+    }
+
+    console.log("Origin validated:", originGeo.formatted);
+    console.log("Destination validated:", destGeo.formatted);
+
+    // Get real road distance between validated coordinates
+    const { miles, duration } = await getDistanceFromCoords(originGeo, destGeo);
     const pricing = calculateTotal(miles);
     const spoken_quote = buildSpokenQuote(vehicle, miles, pricing);
+
     return {
       vehicle,
       miles,
@@ -111,16 +169,13 @@ async function runGetQuote(args) {
       extra_miles: pricing.extra_miles,
       extra_cost: pricing.extra_cost,
       total: pricing.total,
+      origin_verified: originGeo.formatted,
+      destination_verified: destGeo.formatted,
       spoken_quote,
     };
+
   } catch (err) {
     console.error("Quote error:", err.message);
-    if (err.message === "ADDRESS_NOT_FOUND") {
-      return {
-        error: true,
-        spoken_quote: "I wasn't able to locate that address. Can you double-check the street address and city for me?",
-      };
-    }
     return {
       error: true,
       spoken_quote: "I'm having trouble pulling the distance right now. Let me have a dispatcher call you back with the quote.",
